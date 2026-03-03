@@ -43,6 +43,9 @@ def parse(
 
     # Resolver lista de arquivos
     if input_p.is_dir():
+        if not batch:
+            typer.echo("Erro: para processar um diretório, use --batch.", err=True)
+            raise typer.Exit(1)
         files = list(input_p.glob("*.pdf")) + list(input_p.glob("*.PDF"))
     else:
         files = [input_p]

@@ -3,7 +3,7 @@ import hashlib
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, Optional
 
 from doc_preprocessor.models.block import PipelineResult
 
@@ -16,19 +16,15 @@ def _file_sha256(path: str) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def _file_sha256_for_content(content: str) -> str:
-    return "sha256:" + hashlib.sha256(content.encode()).hexdigest()
-
-
 def export_manifest(
     result: PipelineResult,
     output_file: str,
     source_path: str = "",
     total_pages: int = 0,
     duration_seconds: float = 0.0,
-    route_summary: Dict[str, int] = None,
-    config_snapshot: Dict[str, Any] = None,
-    output_files: Dict[str, str] = None,
+    route_summary: Optional[Dict[str, int]] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+    output_files: Optional[Dict[str, str]] = None,
 ):
     """Exporta manifest.json completo conforme Blueprint §4.2."""
     path = Path(output_file)
