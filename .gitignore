@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Preprocess output (gerado pelo pipeline)
+preprocess/
+
+# Cache e logs
+*.sqlite
+*.sqlite3
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Pyre / Pyright
+.pyre/
+.pytype/
+
+# Env
+.env

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doc_preprocessor"
+version = "1.1.0"
+description = "Document Preprocessor — Decoupled Preprocessing Pipeline for RAG"
+readme = "README.md"
+authors = [
+    { name = "Project Maintainer" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "PyMuPDF>=1.23.0",
+    "paddleocr>=2.7.0",
+    "paddlepaddle-gpu", # Assuming GPU usage by default per spec
+    "langdetect>=1.0.9",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "typer>=0.9.0",
+    "numpy",
+    "pytest"
+]
+
+[project.scripts]
+parse = "doc_preprocessor.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

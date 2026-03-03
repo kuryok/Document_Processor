@@ -1,0 +1,51 @@
+# default.yaml configuration
+
+hardware:
+  device: cuda          # cuda | cpu | auto
+  gpu_memory_gb: 8
+  ram_gb: 16
+
+rendering:
+  dpi_default: 200
+  dpi_high: 300
+
+ocr:
+  backend: paddleocr
+  lang: ["pt", "en"]
+  use_gpu: true
+  batch_size: 4
+
+ocr_vl:
+  backend: paddleocr_vl
+  use_gpu: true
+  batch_size: 1
+
+layout:
+  backend: docling
+  use_gpu: true
+
+parallelism:
+  parallel_pages: 2
+  page_queue_size: 10
+
+cache:
+  enabled: true
+  dir: "preprocess/cache"
+  backend: sqlite
+
+thresholds:
+  native_min_chars: 30
+  native_min_coverage: 0.01
+  ocr_confidence_threshold: 0.75
+  ocr_vl_escalation_confidence: 0.75
+  complex_layout_column_threshold: 2
+  min_image_area_px2: 50000
+
+limits:
+  max_pages_per_doc: 500
+  max_render_memory_mb: 512
+
+logging:
+  level: INFO
+  format: json
+  file: "preprocess/logs/pipeline.jsonl"

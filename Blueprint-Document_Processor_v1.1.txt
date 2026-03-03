@@ -1,0 +1,753 @@
+BLUEPRINT: Document Preprocessor — Pipeline de Pré-processamento Desacoplado para RAG
+Versão: 1.1 | Target: Ryzen 5700X · 16 GB RAM · RTX 5060 Ti 8 GB · Windows + WSL2
+
+1. VISÃO GERAL DO SISTEMA
+Propósito
+O Document Preprocessor é um pipeline autônomo que transforma documentos brutos (PDF misto, imagens, DOCX) em artefatos estruturados, normalizados e versionados — prontos para ingestão em qualquer sistema de embeddings/RAG, sem acoplamento a nenhuma framework downstream.
+Princípios de design
+Desacoplamento total: O pipeline não conhece LangChain, LlamaIndex, nem nenhum RAG. A saída é JSON/Markdown puro com schema estável.
+Roteamento adaptativo por página: Cada página é analisada e processada pela rota mais eficiente, não pelo documento inteiro.
+Cache determinístico: Toda etapa é cacheável por hash de conteúdo + parâmetros (DPI, backend, versão do backend, idioma e versão do pipeline). Isso evita cache incompatível após upgrades; reprocessar um PDF já visto custa milissegundos.
+Qualidade sobre velocidade: O pipeline aceita ser lento (ingestão one-shot) em troca de máxima fidelidade de texto.
+Fallback em cascata: Se uma rota falha ou produz resultado abaixo do threshold, a próxima rota é ativada automaticamente.
+Fluxo de alto nível
+PDF/Imagem/DOCX
+      │
+  [0. Ingestion]        → valida, normaliza path, calcula doc_id
+      │
+  [1. Probe]            → classifica CADA página (digital/scan/mixed/complex)
+      │                    gera page_map com rota sugerida
+      │
+  [2. Extract Loop]     → para cada página, executa rota:
+      │  ┌─ native       → PyMuPDF texto direto
+      │  ├─ ocr          → PaddleOCR (GPU)
+      │  ├─ ocr_vl       → PaddleOCR-VL / fallback VLM
+      │  └─ docling/marker → layout estruturado (opcional)
+      │
+  [3. Normalize]        → remove headers/footers repetidos, 
+      │                    corrige hifenização, whitespace
+      │
+  [4. Structure]        → detecta títulos, tabelas, listas,
+      │                    garante ordem de leitura coerente
+      │
+  [5. Export]           → document.md, document.jsonl,
+                          manifest.json, report.json
+
+2. DIAGRAMA TEXTUAL DA ARQUITETURA
+┌─────────────────────────────────────────────────────────────────┐
+│                     CLI: parse <input> --out <dir>              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ ConfigLoader (config.yaml)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Pipeline Orchestrator                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
+│  │ Ingestion│→ │  Probe   │→ │ Extract  │→ │  Normalize +  │  │
+│  │ Module   │  │ Analyzer │  │ Dispatch │  │  Structure    │  │
+│  └──────────┘  └──────────┘  └────┬─────┘  └───────┬───────┘  │
+│                                   │                 │           │
+│                        ┌──────────▼──────┐          │           │
+│                        │  Page Router    │          │           │
+│                        │  ┌───────────┐  │          │           │
+│                        │  │ NativeExt │  │          ▼           │
+│                        │  │ OCRAdapter│  │   ┌─────────────┐   │
+│                        │  │ VLAdapter │  │   │   Exporter  │   │
+│                        │  │DoclingAdp │  │   │  .md/.jsonl │   │
+│                        │  └───────────┘  │   │  manifest   │   │
+│                        └─────────────────┘   │  report     │   │
+│                                              └─────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Cache Layer (SQLite + file hash index)                  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Structured Logger (JSON) + Metrics Collector            │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+
+3. ESTRUTURA DE PASTAS DO PROJETO
+doc_preprocessor/
+├── README.md
+├── pyproject.toml              # dependências + entrypoints
+├── config/
+│   ├── default.yaml            # configuração padrão completa
+│   └── profiles/
+│       ├── fast.yaml           # priorizando velocidade
+│       └── quality.yaml        # priorizando qualidade máxima
+│
+├── src/
+│   └── doc_preprocessor/
+│       ├── __init__.py
+│       ├── cli.py              # CLI principal (Typer/Click)
+│       ├── orchestrator.py     # coordena o pipeline completo
+│       │
+│       ├── ingestion/
+│       │   ├── __init__.py
+│       │   ├── loader.py       # abre PDF/DOCX/imagem, retorna PageStream
+│       │   └── doc_id.py       # geração de doc_id (SHA256 do arquivo)
+│       │
+│       ├── probe/
+│       │   ├── __init__.py
+│       │   ├── analyzer.py     # analisa cada página → PageMeta
+│       │   └── heuristics.py   # funções de classificação (texto, scan, etc.)
+│       │
+│       ├── extract/
+│       │   ├── __init__.py
+│       │   ├── router.py       # Page Router: decide rota por página
+│       │   ├── native.py       # Adapter: PyMuPDF extração nativa
+│       │   ├── ocr.py          # Adapter: PaddleOCR
+│       │   ├── ocr_vl.py       # Adapter: PaddleOCR-VL / VLM fallback
+│       │   ├── docling_adapter.py  # Adapter: Docling (opcional)
+│       │   └── marker_adapter.py   # Adapter: Marker (opcional)
+│       │
+│       ├── normalize/
+│       │   ├── __init__.py
+│       │   ├── header_footer.py  # detecção e remoção de cabeçalho/rodapé
+│       │   ├── hyphen.py         # correção de hifenização
+│       │   └── whitespace.py     # normalização de whitespace
+│       │
+│       ├── structure/
+│       │   ├── __init__.py
+│       │   ├── title_detector.py  # detecta títulos/seções
+│       │   ├── table_extractor.py # isola tabelas como blocos
+│       │   ├── list_detector.py   # detecta listas
+│       │   └── reading_order.py   # garante ordem de leitura (colunas)
+│       │
+│       ├── export/
+│       │   ├── __init__.py
+│       │   ├── md_writer.py       # gera document.md
+│       │   ├── jsonl_writer.py    # gera document.jsonl
+│       │   └── report_writer.py   # gera manifest.json e report.json
+│       │
+│       ├── cache/
+│       │   ├── __init__.py
+│       │   └── page_cache.py      # SQLite-backed cache por hash de página
+│       │
+│       ├── models/
+│       │   ├── __init__.py
+│       │   ├── page_meta.py       # dataclasses dos contratos internos
+│       │   └── block.py           # Block, Chunk etc.
+│       │
+│       └── utils/
+│           ├── __init__.py
+│           ├── logger.py          # structured JSON logger
+│           ├── timer.py           # context manager de tempo por etapa
+│           └── gpu.py             # helpers de VRAM / device management
+│
+├── tests/
+│   ├── unit/
+│   │   ├── test_normalize.py
+│   │   ├── test_heuristics.py
+│   │   └── test_hash.py
+│   ├── integration/
+│   │   ├── test_pipeline_pdf_digital.py
+│   │   ├── test_pipeline_pdf_scan.py
+│   │   └── test_pipeline_pdf_mixed.py
+│   └── fixtures/
+│       ├── sample_digital.pdf
+│       ├── sample_scan.pdf
+│       └── sample_mixed.pdf
+│
+├── preprocess/                    # diretório de trabalho em runtime
+│   ├── input/
+│   └── output/
+│       └── <doc_id>/
+│           ├── document.md
+│           ├── document.jsonl
+│           ├── manifest.json
+│           ├── report.json
+│           ├── pages/
+│           │   ├── 001.png
+│           │   └── 002.png
+│           └── ocr/
+│               ├── 001.json
+│               └── 002.json
+│
+└── scripts/
+    └── benchmark.py               # script de benchmark em PDFs de teste
+
+4. CONTRATOS DE DADOS (SCHEMAS)
+4.1 — document.jsonl (um objeto JSON por linha)
+json{
+  "schema_version": "1.1",
+  "doc_id": "sha256:a1b2c3d4...",
+  "source_path": "/abs/path/to/file.pdf",
+  "page_start": 3,
+  "page_end": 3,
+  "block_index": 12,
+  "block_type": "paragraph",
+  "text": "Conteúdo textual do bloco normalizado.",
+  "markdown": "Conteúdo em **markdown** se aplicável.",
+  "confidence": 0.94,
+  "parser_route": "ocr",
+  "language": "pt",
+  "bbox": [x0, y0, x1, y1],
+  "hash": "sha256:bloco_hash_hex",
+  "flags": {
+    "is_header": false,
+    "is_footer": false,
+    "low_confidence": false,
+    "table_like": false,
+    "complex_layout": false
+  },
+  "pipeline_version": "1.1.0",
+  "created_at": "2025-01-15T10:23:00Z"
+}
+Enums válidos para block_type: title | section_header | paragraph | table | table_row | list | list_item | figure_caption | header | footer | page_number | code_block | footnote
+Enums válidos para parser_route: native | ocr | ocr_vl | docling | marker | hybrid
+4.2 — manifest.json
+json{
+  "schema_version": "1.1",
+  "pipeline_version": "1.1.0",
+  "doc_id": "sha256:a1b2c3d4...",
+  "source_path": "/abs/path/to/file.pdf",
+  "source_hash": "sha256:arquivo_original_hex",
+  "source_size_bytes": 2457600,
+  "total_pages": 42,
+  "processed_at": "2025-01-15T10:23:00Z",
+  "duration_seconds": 187.4,
+  "config_used": {
+    "dpi_render": 200,
+    "ocr_backend": "paddleocr",
+    "ocr_vl_backend": "paddleocr_vl",
+    "layout_backend": "docling",
+    "native_min_chars": 50,
+    "ocr_confidence_threshold": 0.75,
+    "parallel_pages": 2,
+    "use_gpu": true
+  },
+  "route_summary": {
+    "native": 28,
+    "ocr": 10,
+    "ocr_vl": 3,
+    "docling": 1
+  },
+  "output_files": {
+    "document_md": "document.md",
+    "document_jsonl": "document.jsonl",
+    "report_json": "report.json"
+  },
+  "dependencies": {
+    "python": "3.11.4",
+    "pymupdf": "1.23.6",
+    "paddleocr": "2.7.3",
+    "docling": "1.2.0"
+  },
+  "checksums": {
+    "document_md": "sha256:...",
+    "document_jsonl": "sha256:...",
+    "report_json": "sha256:..."
+  }
+}
+4.3 — report.json
+json{
+  "schema_version": "1.1",
+  "doc_id": "sha256:a1b2c3d4...",
+  "pipeline_version": "1.1.0",
+  "pages": [
+    {
+      "page_num": 1,
+      "chars_native": 1240,
+      "chars_ocr": 0,
+      "ocr_confidence_avg": null,
+      "ocr_confidence_min": null,
+      "route_chosen": "native",
+      "route_fallback_reason": null,
+      "flags": {
+        "complex_layout": false,
+        "table_like": false,
+        "low_confidence": false,
+        "multi_column": false,
+        "has_images": false
+      },
+      "timings_ms": {
+        "probe": 12,
+        "render": 0,
+        "extract": 45,
+        "normalize": 8,
+        "structure": 14,
+        "total": 79
+      },
+      "blocks_extracted": 7
+    }
+  ],
+  "summary": {
+    "total_chars": 58420,
+    "pages_native": 28,
+    "pages_ocr": 10,
+    "pages_ocr_vl": 3,
+    "pages_docling": 1,
+    "ocr_confidence_avg": 0.88,
+    "low_confidence_pages": [17, 31],
+    "flagged_pages": {
+      "complex_layout": [5, 6, 22],
+      "table_like": [8, 9, 23],
+      "multi_column": [3, 4, 5]
+    },
+    "total_blocks": 312,
+    "total_duration_ms": 187400
+  }
+}
+
+5. PAGE ROUTER — DETALHAMENTO
+5.1 — Heurísticas e Thresholds
+O Page Router executa em dois momentos: durante o Probe (análise rápida de todo o documento) e durante o Extract (decisão final por página, podendo refinar com base no resultado).
+Classificação na fase Probe (PyMuPDF apenas, sem OCR):
+pythondef classify_page(page: fitz.Page, config: Config) -> PageMeta:
+    
+    # 1. Texto nativo extraído
+    text = page.get_text("text")
+    char_count = len(text.strip())
+    
+    # 2. Contagem de imagens rasterizadas na página
+    image_list = page.get_images(full=True)
+    has_large_raster = any(
+        img[2] * img[3] > config.min_image_area  # width * height
+        for img in image_list
+    )
+    
+    # 3. Cobertura do texto na página (text_coverage)
+    page_area = page.rect.width * page.rect.height
+    text_blocks = page.get_text("blocks")
+    covered_area = sum((b[2]-b[0]) * (b[3]-b[1]) for b in text_blocks)
+    text_coverage = covered_area / page_area if page_area > 0 else 0
+    
+    # 4. Detectar layout complexo (múltiplas colunas, tabelas)
+    column_count = estimate_columns(text_blocks)
+    has_table_markers = detect_table_heuristic(text_blocks)
+    
+    return PageMeta(
+        char_count=char_count,
+        has_large_raster=has_large_raster,
+        text_coverage=text_coverage,
+        column_count=column_count,
+        has_table_markers=has_table_markers
+    )
+Thresholds sugeridos (ajustáveis em config.yaml):
+ParâmetroValor padrãoSignificadonative_min_chars80Mínimo de chars para considerar "tem texto nativo"native_min_coverage0.05Cobertura mínima da página com textoocr_confidence_threshold0.75Abaixo disso → promove para ocr_vlocr_vl_fallback_confidence0.55Abaixo disso → loga como baixa confiançacomplex_layout_columns2Número de colunas que define "complexo"min_image_area50000 px²Área mínima de raster para detectar scan
+
+5.1.1 — DPI adaptativo (v1.1)
+- Default: renderizar páginas para OCR em **200 DPI** (equilíbrio qualidade/tempo).
+- Se a página estiver marcada como **table_like** ou **complex_layout**, ou se o OCR retornar **baixa confiança**, re-renderizar a mesma página em **300 DPI** e repetir o OCR.
+- Se após OCR em 300 DPI ainda estiver abaixo do threshold, promover para **OCR_VL**.
+- Objetivo: gastar custo extra apenas nas páginas difíceis, maximizando qualidade sem explodir memória.
+5.2 — Lógica de decisão do Router
+pythondef route_page(meta: PageMeta, config: Config) -> Route:
+    
+    # CASO 1: Página com texto nativo suficiente
+    if (meta.char_count >= config.native_min_chars 
+        and meta.text_coverage >= config.native_min_coverage):
+        
+        # Sub-caso: layout complexo com tabelas → usar docling para estrutura
+        if (meta.has_table_markers or meta.column_count >= 2) 
+            and config.enable_docling:
+            return Route.DOCLING
+        
+        return Route.NATIVE
+    
+    # CASO 2: Página com imagem grande ou poucos chars → scan
+    if meta.has_large_raster or meta.char_count < config.native_min_chars:
+        return Route.OCR  # OCR_VL decidido DEPOIS de ver resultado
+    
+    # CASO 3: Misto (algum texto mas suspeito)
+    return Route.OCR
+5.3 — Promoção para OCR_VL (pós-OCR)
+Após o OCR normal rodar, o resultado é avaliado:
+pythondef should_escalate_to_vl(ocr_result: OCRResult, config: Config) -> bool:
+    
+    # Confiança média baixa
+    if ocr_result.avg_confidence < config.ocr_confidence_threshold:
+        return True
+    
+    # Menos de N chars extraídos apesar de ter imagem
+    if ocr_result.char_count < config.native_min_chars:
+        return True
+    
+    # Alta proporção de caracteres "lixo" (símbolos, replacement chars)
+    garbage_ratio = count_garbage_chars(ocr_result.text) / max(ocr_result.char_count, 1)
+    if garbage_ratio > 0.15:
+        return True
+    
+    return False
+5.4 — Detecção de "página complexa"
+Uma página é marcada como complex_layout = True quando qualquer uma das condições abaixo for verdadeira:
+Detecção de múltiplas colunas: Agrupa os bounding boxes de texto blocks por posição X. Se há dois ou mais clusters de X distintos com sobreposição vertical e largura individual < 50% da página, provavelmente é multi-coluna.
+Detecção de tabelas (heurística): Conta linhas horizontais e verticais (page.get_drawings()). Se há 4 ou mais linhas formando grade, ou se blocos de texto estão alinhados em grade regular (desvio padrão de X baixo com múltiplas colunas), sinaliza tabela.
+Detecção de formulário: Alta quantidade de short text blocks (< 5 palavras) distribuídos uniformemente — típico de formulários com campos.
+
+6. ESTRATÉGIA DE MERGE (native vs OCR)
+Quando uma página retorna da rota native, alguns renderers de PDF geram texto fora de ordem ou com artefatos. Há casos onde o texto nativo existe mas está incompleto (PDF com OCR embutido mal-feito). A estratégia de merge resolve isso:
+Regra geral: native wins, OCR fills gaps
+pythondef merge_native_ocr(native_text: str, ocr_result: OCRResult, config: Config) -> str:
+    
+    # Se native tem chars suficientes e qualidade OK → usa só native
+    if len(native_text.strip()) >= config.native_min_chars:
+        return native_text
+    
+    # Se native tem algum texto mas OCR tem mais → usa OCR se confiança alta
+    if len(ocr_result.text) > len(native_text) * 1.5:
+        if ocr_result.avg_confidence >= config.ocr_confidence_threshold:
+            return ocr_result.text
+    
+    # Se nenhum tem texto suficiente → escalona para OCR_VL
+    return None  # sinaliza escalação
+Anti-duplicação via hash de segmento
+Ao montar o JSONL, cada bloco gera um hash SHA256 de seu texto normalizado. Blocos com hash idêntico (do mesmo doc_id) são descartados no segundo processamento. Isso evita duplicatas quando uma página foi processada por rotas diferentes em reprocessamentos.
+pythondef dedup_blocks(blocks: List[Block]) -> List[Block]:
+    seen = set()
+    result = []
+    for block in blocks:
+        h = hashlib.sha256(block.normalized_text.encode()).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            result.append(block)
+    return result
+Merge de colunas
+Para páginas multi-coluna onde o PyMuPDF retorna texto misturado entre colunas, o módulo reading_order.py re-ordena os blocos de texto por posição:
+Algoritmo de re-ordenação por coluna:
+
+Clusterizar blocos por posição X (k-means com k=número estimado de colunas)
+Para cada cluster (coluna), ordenar por Y crescente
+Concatenar colunas da esquerda para direita
+
+
+7. ESTRATÉGIA DE DETECÇÃO E REMOÇÃO DE HEADER/FOOTER
+Headers e rodapés são texto que aparece em posição consistente e com conteúdo repetido ou semi-repetido ao longo do documento.
+Detecção
+pythondef detect_headers_footers(
+    all_pages_blocks: List[List[Block]], 
+    config: Config
+) -> HeaderFooterSignature:
+    
+    n_pages = len(all_pages_blocks)
+    
+    # Extrair blocos do topo e do rodapé (por bounding box Y)
+    top_candidates = []
+    bottom_candidates = []
+    
+    for page_blocks in all_pages_blocks:
+        page_height = get_page_height(page_blocks)
+        for block in page_blocks:
+            rel_y = block.bbox.y0 / page_height
+            if rel_y < 0.08:   # top 8% da página
+                top_candidates.append(normalize_for_comparison(block.text))
+            elif rel_y > 0.92:  # bottom 8% da página
+                bottom_candidates.append(normalize_for_comparison(block.text))
+    
+    # Texto que aparece em > 70% das páginas é header/footer
+    header_patterns = find_frequent_patterns(top_candidates, threshold=0.70, n_pages=n_pages)
+    footer_patterns = find_frequent_patterns(bottom_candidates, threshold=0.70, n_pages=n_pages)
+    
+    return HeaderFooterSignature(headers=header_patterns, footers=footer_patterns)
+normalize_for_comparison: Remove números de página (regex \b\d+\b), datas, e aplica lowercase + strip antes de comparar.
+find_frequent_patterns: Usa sequência edit-distance leve (difflib) para agrupar variações do mesmo header (ex.: "Relatório Anual 2023 | Pág. 3" vs "Relatório Anual 2023 | Pág. 4").
+Remoção
+A remoção é feita na fase Normalize, após o Extract estar completo para todas as páginas. Os blocos marcados como is_header=True ou is_footer=True são exportados no JSONL com block_type: "header" / "footer" (não descartados — preservação para debug), mas excluídos do document.md principal.
+
+8. ESTRATÉGIA DE ESTRUTURAÇÃO
+8.1 — Detecção de títulos e seções
+Critérios cumulativos (score-based, threshold > 2 pontos):
+CritérioPontosTexto com fonte maior que mediana do documento+2Texto em negrito (metadata da fonte via PyMuPDF)+1Linha curta (< 80 chars) sozinha no bloco+1Bloco precedido por espaço vertical > 1.5x altura de linha+1Texto começa com número + ponto (ex: "3.1 Introdução")+2Texto em CAPS LOCK+1Linha seguida por bloco de parágrafo longo+1
+Nível de hierarquia: H1 (score ≥ 5), H2 (score 3–4), H3 (score 2).
+8.2 — Separação de tabelas
+Tabelas são extraídas como blocos próprios (block_type: "table"). Estratégia por rota:
+Rota native/docling: page.find_tables() do PyMuPDF 1.23+ retorna tabelas estruturadas. O conteúdo é convertido para Markdown de tabela.
+Rota OCR: Heurística por alinhamento de colunas: grupos de texto boxes com X-position regular e Y-position em grade → convertido para | col1 | col2 | markdown.
+Fallback: Se a tabela não puder ser estruturada, é exportada como block_type: "table" com text raw e flag complex_layout: true.
+8.3 — Detecção de listas
+Critérios: linha começa com •, -, *, – seguido de espaço; ou começa com número/letra seguido de . ou ). Blocos consecutivos de lista são agrupados em block_type: "list" com sub-blocos list_item.
+8.4 — Ordem de leitura
+Para documentos com colunas e/ou texto espalhado (formulários, layouts editoriais), o reading_order.py implementa o algoritmo:
+
+Detectar colunas via clustering de X (já descrito em §6)
+Para página sem colunas: ordenar por Y crescente, X secundário
+Para página com 2 colunas: processar coluna esquerda completa, depois coluna direita
+Para tabelas: manter ordem natural (linha por linha, esquerda para direita)
+Captions de figuras: sempre imediatamente após o bloco de figura
+
+
+9. PIPELINE — PSEUDOCÓDIGO COM PONTOS DE EXTENSÃO
+python# orchestrator.py
+
+class PipelineOrchestrator:
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.cache = PageCache(config.cache_dir)
+        self.logger = StructuredLogger(config.log_level)
+        
+        # Adapters (pontos de extensão — injetáveis via config)
+        self.loaders: Dict[str, BaseLoader] = {
+            "pdf": PDFLoader(),
+            "image": ImageLoader(),
+            "docx": DocxLoader(),
+        }
+        self.extractors: Dict[Route, BaseExtractor] = {
+            Route.NATIVE:   NativeExtractor(config),
+            Route.OCR:      OCRAdapter(config),       # PaddleOCR
+            Route.OCR_VL:   VLAdapter(config),        # PaddleOCR-VL
+            Route.DOCLING:  DoclingAdapter(config),   # opcional
+            Route.MARKER:   MarkerAdapter(config),    # opcional
+        }
+    
+    def run(self, input_path: Path, output_dir: Path) -> PipelineResult:
+        
+        with Timer("total") as t_total:
+            
+            # 0. INGESTION
+            doc_id = compute_doc_id(input_path)
+            loader = self.loaders[detect_format(input_path)]
+            page_stream = loader.load(input_path)  # lazy iterator
+            
+            # 1. PROBE (análise rápida de todas as páginas)
+            with Timer("probe"):
+                page_map = self.probe(page_stream)
+            
+            # 2. EXTRACT (paralelo controlado)
+            all_page_results = []
+            with ThreadPoolExecutor(max_workers=self.config.parallel_pages) as pool:
+                futures = {
+                    pool.submit(self.extract_page, page, meta, doc_id): page.num
+                    for page, meta in page_map.items()
+                }
+                for future in as_completed(futures):
+                    all_page_results.append(future.result())
+            
+            all_page_results.sort(key=lambda r: r.page_num)
+            
+            # 3. NORMALIZE
+            with Timer("normalize"):
+                hf_sig = detect_headers_footers(all_page_results)
+                normalized = [normalize_page(p, hf_sig, self.config) 
+                              for p in all_page_results]
+            
+            # 4. STRUCTURE
+            with Timer("structure"):
+                structured_blocks = structure_document(normalized, self.config)
+            
+            # 5. EXPORT
+            with Timer("export"):
+                export(structured_blocks, doc_id, input_path, output_dir, 
+                       self.config, t_total.elapsed)
+        
+        return PipelineResult(doc_id=doc_id, output_dir=output_dir)
+    
+    def extract_page(self, page: Page, meta: PageMeta, doc_id: str) -> PageResult:
+        
+        # Verificar cache primeiro
+        cache_key = compute_cache_key(page, dpi=meta.dpi, backend=meta.backend, backend_version=meta.backend_version, lang=meta.language, pipeline_version=PIPELINE_VERSION)
+        if cached := self.cache.get(cache_key):
+            self.logger.info("cache_hit", page=page.num)
+            return cached
+        
+        route = self.router.route_page(meta, self.config)
+        
+        # Renderizar página para imagem (necessário para OCR)
+        img = None
+        if route in (Route.OCR, Route.OCR_VL, Route.DOCLING):
+            img = render_page(page, dpi=self.config.dpi_render)
+            save_page_image(img, output_dir, page.num)  # cache opcional
+        
+        # Executar extrator
+        try:
+            extractor = self.extractors[route]
+            result = extractor.extract(page, img, meta)
+            
+            # Pós-validação: escalonamento para VL se necessário
+            if route == Route.OCR and should_escalate_to_vl(result, self.config):
+                self.logger.info("escalate_to_vl", page=page.num, 
+                                 confidence=result.avg_confidence)
+                result = self.extractors[Route.OCR_VL].extract(page, img, meta)
+                result.route = Route.OCR_VL
+        
+        except Exception as e:
+            # FALLBACK CASCADE
+            result = self.fallback_extract(page, img, meta, failed_route=route, error=e)
+        
+        self.cache.set(cache_key, result)
+        return result
+    
+    def fallback_extract(self, page, img, meta, failed_route, error):
+        """Cascata de fallback: docling/marker→ocr→ocr_vl→native→empty"""
+        self.logger.warning("extractor_failed", route=failed_route, error=str(error))
+        
+        fallback_order = {
+            Route.DOCLING: Route.OCR,
+            Route.MARKER:  Route.OCR,
+            Route.OCR:     Route.OCR_VL,
+            Route.OCR_VL:  Route.NATIVE,
+            Route.NATIVE:  None,
+        }
+        
+        next_route = fallback_order.get(failed_route)
+        if next_route is None:
+            return PageResult.empty(page.num)
+        
+        try:
+            result = self.extractors[next_route].extract(page, img, meta)
+            result.route = next_route
+            result.fallback_reason = f"fallback_from_{failed_route.value}"
+            return result
+        except Exception:
+            return PageResult.empty(page.num)
+Interface de Adapter (ponto de extensão):
+python# Qualquer novo backend deve implementar esta interface
+class BaseExtractor(ABC):
+    
+    @abstractmethod
+    def extract(
+        self, 
+        page: Page,           # objeto página do PDF
+        image: np.ndarray,    # imagem renderizada (pode ser None para native)
+        meta: PageMeta        # metadados do probe
+    ) -> PageResult:
+        """Retorna PageResult com blocos extraídos e métricas."""
+        pass
+    
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Verifica se o backend está instalado e funcional."""
+        pass
+
+10. PLANO DE MVP
+v1 — MVP (2–3 semanas)
+Objetivo: Pipeline funcional end-to-end para PDFs mistos, com todas as saídas contratuais.
+Módulos incluídos:
+
+Ingestion (PDF via PyMuPDF apenas)
+Probe básico (chars nativo + detectar imagem grande)
+Extract: native + OCR via PaddleOCR (GPU)
+Normalize: whitespace + hifenização
+Header/footer detection (heurística simples por posição Y)
+Structure: títulos básicos + parágrafos
+Export: document.md, document.jsonl, manifest.json, report.json
+Cache por hash de página (SQLite)
+CLI: parse <input> --out <dir>
+Config YAML
+Testes unitários: normalize, hash, heuristics
+
+O que fica fora do v1:
+
+OCR_VL, Docling, Marker
+Detecção de tabelas estruturadas
+Multi-coluna ordering
+Listas detalhadas
+DOCX/imagem como input
+
+v2 — Qualidade e Robustez (4–6 semanas após v1)
+Adições:
+
+OCR_VL adapter (PaddleOCR-VL)
+Docling adapter (layout + tabelas)
+page.find_tables() para extração estruturada de tabelas
+Reading order completo (multi-coluna)
+Detecção de listas
+Input: DOCX e imagens PNG/JPEG
+Testes de integração com PDFs reais (3 fixtures)
+Paralelismo refinado com semáforo de VRAM
+Dashboard de report mais rico (histogramas de confiança)
+Benchmark script
+
+v3 — Avançado (roadmap)
+
+Marker adapter para documentos acadêmicos
+Fine-tuning de thresholds via feedback loop
+Suporte a PDFs protegidos (com senha via config)
+API REST local (FastAPI) para ingestão batch
+Plugin de figure caption com extração de imagem base64
+
+
+11. DEFAULTS PARA SUA MÁQUINA (RTX 5060 Ti 8 GB + 16 GB RAM)
+yaml# config/default.yaml
+
+hardware:
+  device: cuda          # cuda | cpu | auto
+  gpu_memory_gb: 8
+  ram_gb: 16
+
+rendering:
+  dpi_default: 200
+  dpi_high: 300       # 150 rápido | 200 equilíbrio | 300 máxima qualidade
+  # 200 DPI gera ~1700x2200px para A4 — suficiente para PaddleOCR
+
+ocr:
+  backend: paddleocr
+  lang: ["pt", "en"]
+  use_gpu: true
+  batch_size: 4         # imagens por batch no GPU
+  # 8GB VRAM suporta bem batch_size=4 com PaddleOCR (modelo ~1.5GB)
+
+ocr_vl:
+  backend: paddleocr_vl
+  use_gpu: true
+  batch_size: 1         # VL é pesado; 1 por vez para não explodir VRAM
+
+layout:
+  backend: docling      # docling | marker | none
+  use_gpu: true
+
+parallelism:
+  parallel_pages: 2     # páginas OCR simultâneas
+  # Justificativa: 2 páginas OCR simultâneas com batch=4 mantém VRAM segura
+  # 3+ páginas pode causar OOM com VL ativo
+  page_queue_size: 10
+
+cache:
+  enabled: true
+  dir: "preprocess/cache"
+  backend: sqlite       # sqlite | filesystem
+
+thresholds:
+  native_min_chars: 80
+  native_min_coverage: 0.05
+  ocr_confidence_threshold: 0.75
+  ocr_vl_escalation_confidence: 0.75
+  complex_layout_column_threshold: 2
+  min_image_area_px2: 50000
+
+limits:
+  max_pages_per_doc: 500    # docs maiores → processados em chunks
+  max_render_memory_mb: 512 # não cachear renders > este tamanho total
+
+logging:
+  level: INFO
+  format: json            # json | text
+  file: "preprocess/logs/pipeline.jsonl"
+Notas de tuning:
+Para documentos com muitas páginas escaneadas: reduzir parallel_pages para 1 e aumentar batch_size para 8.
+Para documentos predominantemente digitais: parallel_pages pode subir para 4 sem problemas (native não usa GPU).
+Se OCR_VL for habilitado frequentemente: manter parallel_pages: 1 durante páginas VL (o orchestrator detecta automaticamente qual rota vai usar).
+
+12. RISCOS E MITIGAÇÕES
+RiscoProbabilidadeImpactoMitigaçãoOOM de VRAM com OCR_VL em páginas grandesAltaAltoSemáforo de VRAM por rota; downscale de imagem para VL (max 1600px)PyMuPDF texto nativo em ordem errada (PDF mal-gerado)MédiaAltoValidar coverage; se < threshold, escalar para OCR mesmo com chars suficientesPaddleOCR versão nova com API quebradaBaixaMédioPin de versão no pyproject.toml; adapter isola APIHeaders/footers não detectados (variação alta)MédiaBaixoThreshold ajustável; blocos são preservados no JSONL para inspeçãoTabelas complexas viram texto linearAltaMédioDocling para páginas com tabelas; fallback para raw text com flagPDFs com fontes não-embutidas (chars ilegíveis no native)MédiaAltoGarbage detection em native text; fallback automático para OCRDocling lento demais para grandes volumesAltaBaixoDocling é opt-in por página; apenas para páginas sinalizadas como complex_layoutCache desatualizado após upgrade de pipelineBaixaMédioCache keyed por hash da imagem E versão do pipeline — invalida automaticamenteRAM insuficiente para carregar PDF inteiroBaixaAltoStream de páginas (lazy loading via PyMuPDF); nunca carregar doc inteiro em memóriaIdioma não reconhecido pelo OCRBaixaMédioDetecção automática de idioma (langdetect) antes do OCR; fallback para en
+
+APÊNDICE: ARQUIVO CONFIG COMPLETO E CLI
+CLI (parse command)
+bash# Uso básico
+parse document.pdf --out ./preprocess/output
+
+# Com config customizada
+parse document.pdf --out ./preprocess/output --config config/quality.yaml
+
+# Batch
+parse ./input_folder/ --out ./preprocess/output --batch
+
+# Só probe (sem extract — para inspecionar o documento)
+parse document.pdf --out ./preprocess/output --probe-only
+
+# Forçar rota para todas as páginas
+parse document.pdf --out ./preprocess/output --force-route ocr
+
+# Reprocessar mesmo se cache existir
+parse document.pdf --out ./preprocess/output --no-cache
+
+# Verbose com logs no terminal
+parse document.pdf --out ./preprocess/output --log-level DEBUG --log-format text
+Exemplo de saída de log (JSON)
+json{"ts": "2025-01-15T10:23:45Z", "level": "INFO",  "event": "pipeline_start",     "doc_id": "sha256:a1b2...", "pages": 42}
+{"ts": "2025-01-15T10:23:46Z", "level": "INFO",  "event": "probe_complete",      "native": 28, "scan": 10, "mixed": 4, "duration_ms": 890}
+{"ts": "2025-01-15T10:23:47Z", "level": "INFO",  "event": "page_extracted",      "page": 1, "route": "native", "chars": 1240, "duration_ms": 45}
+{"ts": "2025-01-15T10:24:01Z", "level": "INFO",  "event": "escalate_to_vl",      "page": 17, "confidence": 0.61, "prev_route": "ocr"}
+{"ts": "2025-01-15T10:24:02Z", "level": "WARN",  "event": "low_confidence_page", "page": 17, "confidence": 0.68}
+{"ts": "2025-01-15T10:26:12Z", "level": "INFO",  "event": "pipeline_complete",   "doc_id": "sha256:a1b2...", "blocks": 312, "duration_s": 187.4}
+
+Este blueprint cobre todas as 12 seções solicitadas. O design é intencionalmente plugável: cada adapter implementa a interface BaseExtractor, cada módulo de normalização é uma função pura testável, e o schema de saída é estável o suficiente para ser consumido por qualquer RAG sem modificações no preprocessador. A v1 pode ser entregue em 2–3 semanas com uma pessoa focada. Sonnet 4.6EstendidoClaude é uma IA e pode cometer erros. Por favor, verifique as respostas.
