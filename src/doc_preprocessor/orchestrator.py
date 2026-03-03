@@ -107,123 +107,122 @@ class PipelineOrchestrator:
         loader = self.loaders[fmt]
         self.logger.info("pipeline_start", doc_id=doc_id, path=str(input_path))
 
-        page_stream = list(loader.load(str(input_path)))
-        total_pages = loader.get_total_pages()
+        try:
+            page_stream = list(loader.load(str(input_path)))
+            total_pages = loader.get_total_pages()
 
-        # Preparar diretório de saída
-        out_dir = output_dir / doc_id.replace("sha256:", "")
-        out_dir.mkdir(parents=True, exist_ok=True)
+            # Preparar diretório de saída
+            out_dir = output_dir / doc_id.replace("sha256:", "")
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. PROBE
-        page_map: Dict[int, PageMeta] = {}
-        route_counter: Dict[str, int] = {"native": 0, "ocr": 0, "ocr_vl": 0, "docling": 0}
+            # 1. PROBE
+            page_map: Dict[int, PageMeta] = {}
+            route_counter: Dict[str, int] = {"native": 0, "ocr": 0, "ocr_vl": 0, "docling": 0}
 
-        with Timer("probe") as t_probe:
-            for page in page_stream:
-                meta = analyze_page(page, self.config)
-                meta.doc_id = doc_id
-                meta.source_path = str(input_path)
-                page_map[page.number + 1] = meta
+            with Timer("probe") as t_probe:
+                for page in page_stream:
+                    meta = analyze_page(page, self.config)
+                    meta.doc_id = doc_id
+                    meta.source_path = str(input_path)
+                    page_map[page.number + 1] = meta
 
-        self.logger.info("probe_complete", total_pages=total_pages, duration_ms=round(t_probe.elapsed_ms, 1))
+            self.logger.info("probe_complete", total_pages=total_pages, duration_ms=round(t_probe.elapsed_ms, 1))
 
-        if probe_only:
-            # Apenas salva o probe result e retorna
+            if probe_only:
+                # Apenas salva o probe result e retorna
+                return PipelineResult(doc_id=doc_id, output_dir=str(out_dir))
+
+            # 2. EXTRACT
+            all_page_results: List[PageResult] = []
+
+            with Timer("extract"):
+                for page in page_stream:
+                    page_num = page.number + 1
+                    meta = page_map[page_num]
+                    res = self._extract_page(page, meta, doc_id, force_route, out_dir)
+                    route_counter[res.route_chosen.value] = route_counter.get(res.route_chosen.value, 0) + 1
+                    all_page_results.append(res)
+
+            # 3. NORMALIZE
+            with Timer("normalize"):
+                all_blocks_by_page = [r.blocks for r in all_page_results]
+                hf_sig = detect_headers_footers(all_blocks_by_page, self.config)
+
+                consolidated_blocks: List[Block] = []
+                for p_res in all_page_results:
+                    p_res.blocks = apply_header_footer_flags(p_res.blocks, hf_sig)
+                    for b in p_res.blocks:
+                        b.text = fix_hyphenation(b.text)
+                        b.text = normalize_whitespace(b.text)
+                    consolidated_blocks.extend(p_res.blocks)
+
+            # 4. STRUCTURE
+            with Timer("structure"):
+                structured_blocks = assign_block_structure(consolidated_blocks)
+                structured_blocks = detect_lists(structured_blocks)
+                structured_blocks = natural_reading_order(structured_blocks)
+                structured_blocks = dedup_blocks(structured_blocks)
+
+            # 5. EXPORT
+            md_path = out_dir / "document.md"
+            jsonl_path = out_dir / "document.jsonl"
+            manifest_path = out_dir / "manifest.json"
+            report_path = out_dir / "report.json"
+
+            with Timer("export"):
+                export_markdown(structured_blocks, str(md_path))
+                export_jsonl(structured_blocks, str(jsonl_path))
+
+            duration_s = time.monotonic() - t_start
+
+            # Config snapshot para o manifest
+            config_snapshot = {
+                "dpi_render": self.config.rendering.dpi_default,
+                "ocr_backend": self.config.ocr.backend,
+                "ocr_vl_backend": self.config.ocr_vl.backend,
+                "layout_backend": self.config.layout.backend,
+                "native_min_chars": self.config.thresholds.native_min_chars,
+                "native_min_coverage": self.config.thresholds.native_min_coverage,
+                "ocr_confidence_threshold": self.config.thresholds.ocr_confidence_threshold,
+                "parallel_pages": self.config.parallelism.parallel_pages,
+                "use_gpu": self.config.hardware.device == "cuda",
+            }
+
+            output_files = {
+                "document_md": str(md_path),
+                "document_jsonl": str(jsonl_path),
+                "report_json": str(report_path),
+            }
+
             result = PipelineResult(doc_id=doc_id, output_dir=str(out_dir))
-            loader.close()
+
+            export_manifest(
+                result=result,
+                output_file=str(manifest_path),
+                source_path=str(input_path),
+                total_pages=total_pages,
+                duration_seconds=duration_s,
+                route_summary=route_counter,
+                config_snapshot=config_snapshot,
+                output_files=output_files,
+            )
+
+            report_data = build_report(
+                doc_id=doc_id,
+                all_page_results=all_page_results,
+                total_duration_ms=duration_s * 1000,
+            )
+            export_report(report_data, str(report_path))
+
+            self.logger.info(
+                "pipeline_complete",
+                doc_id=doc_id,
+                blocks=len(structured_blocks),
+                duration_s=round(duration_s, 3),
+            )
             return result
-
-        # 2. EXTRACT
-        all_page_results: List[PageResult] = []
-
-        with Timer("extract"):
-            for page in page_stream:
-                page_num = page.number + 1
-                meta = page_map[page_num]
-                res = self._extract_page(page, meta, doc_id, force_route, out_dir)
-                route_counter[res.route_chosen.value] = route_counter.get(res.route_chosen.value, 0) + 1
-                all_page_results.append(res)
-
-        loader.close()
-
-        # 3. NORMALIZE
-        with Timer("normalize"):
-            all_blocks_by_page = [r.blocks for r in all_page_results]
-            hf_sig = detect_headers_footers(all_blocks_by_page, self.config)
-
-            consolidated_blocks: List[Block] = []
-            for p_res in all_page_results:
-                p_res.blocks = apply_header_footer_flags(p_res.blocks, hf_sig)
-                for b in p_res.blocks:
-                    b.text = fix_hyphenation(b.text)
-                    b.text = normalize_whitespace(b.text)
-                consolidated_blocks.extend(p_res.blocks)
-
-        # 4. STRUCTURE
-        with Timer("structure"):
-            structured_blocks = assign_block_structure(consolidated_blocks)
-            structured_blocks = detect_lists(structured_blocks)
-            structured_blocks = natural_reading_order(structured_blocks)
-            structured_blocks = dedup_blocks(structured_blocks)
-
-        # 5. EXPORT
-        md_path = out_dir / "document.md"
-        jsonl_path = out_dir / "document.jsonl"
-        manifest_path = out_dir / "manifest.json"
-        report_path = out_dir / "report.json"
-
-        with Timer("export"):
-            export_markdown(structured_blocks, str(md_path))
-            export_jsonl(structured_blocks, str(jsonl_path))
-
-        duration_s = time.monotonic() - t_start
-
-        # Config snapshot para o manifest
-        config_snapshot = {
-            "dpi_render": self.config.rendering.dpi_default,
-            "ocr_backend": self.config.ocr.backend,
-            "ocr_vl_backend": self.config.ocr_vl.backend,
-            "layout_backend": self.config.layout.backend,
-            "native_min_chars": self.config.thresholds.native_min_chars,
-            "native_min_coverage": self.config.thresholds.native_min_coverage,
-            "ocr_confidence_threshold": self.config.thresholds.ocr_confidence_threshold,
-            "parallel_pages": self.config.parallelism.parallel_pages,
-            "use_gpu": self.config.hardware.device == "cuda",
-        }
-
-        output_files = {
-            "document_md": str(md_path),
-            "document_jsonl": str(jsonl_path),
-            "report_json": str(report_path),
-        }
-
-        result = PipelineResult(doc_id=doc_id, output_dir=str(out_dir))
-
-        export_manifest(
-            result=result,
-            output_file=str(manifest_path),
-            source_path=str(input_path),
-            total_pages=total_pages,
-            duration_seconds=duration_s,
-            route_summary=route_counter,
-            config_snapshot=config_snapshot,
-            output_files=output_files,
-        )
-
-        report_data = build_report(
-            doc_id=doc_id,
-            all_page_results=all_page_results,
-            total_duration_ms=duration_s * 1000,
-        )
-        export_report(report_data, str(report_path))
-
-        self.logger.info(
-            "pipeline_complete",
-            doc_id=doc_id,
-            blocks=len(structured_blocks),
-            duration_s=round(duration_s, 3),
-        )
-        return result
+        finally:
+            loader.close()
 
     def _extract_page(
         self,

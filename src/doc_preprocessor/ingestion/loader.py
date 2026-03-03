@@ -13,6 +13,11 @@ class BaseLoader(ABC):
     def get_total_pages(self) -> int:
         pass
 
+    @abstractmethod
+    def close(self) -> None:
+        """Releases underlying document resources."""
+        pass
+
 class PDFLoader(BaseLoader):
     """Loads PDF documents lazily using PyMuPDF."""
     
@@ -35,7 +40,7 @@ class PDFLoader(BaseLoader):
     def get_total_pages(self) -> int:
         return self._total_pages
         
-    def close(self):
+    def close(self) -> None:
         if self._doc:
             self._doc.close()
 
