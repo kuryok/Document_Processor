@@ -239,10 +239,10 @@ class PipelineOrchestrator:
         if self.cache:
             cache_key = compute_cache_key(
                 page_hash=f"{doc_id}_p{page_num}",
-                dpi=meta.dpi,
-                backend=meta.backend,
-                backend_version=meta.backend_version,
-                lang=meta.language,
+                dpi=meta.dpi if meta.dpi is not None else self.config.rendering.dpi_default,
+                backend=meta.backend or self.config.ocr.backend,
+                backend_version=meta.backend_version or PIPELINE_VERSION,
+                lang=meta.language or "en",
                 pipeline_version=PIPELINE_VERSION,
             )
             cached = self.cache.get(cache_key)

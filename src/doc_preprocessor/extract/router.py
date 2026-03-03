@@ -29,9 +29,9 @@ def route_page(meta: PageMeta, config: Config) -> ParserRoute:
     # CASE 3: Mixed or ambiguous → OCR fallback
     return ParserRoute.OCR
 
-def should_escalate_to_vl(ocr_result_avg_conf: float, extracted_chars: int, config: Config) -> bool:
+def should_escalate_to_vl(ocr_result_avg_conf: float | None, extracted_chars: int, config: Config) -> bool:
     """Check if basic OCR failed to meet thresholds and we should escalate to VL."""
-    if ocr_result_avg_conf and ocr_result_avg_conf < config.thresholds.ocr_confidence_threshold:
+    if ocr_result_avg_conf is not None and ocr_result_avg_conf < config.thresholds.ocr_confidence_threshold:
         return True
         
     if extracted_chars < config.thresholds.native_min_chars:

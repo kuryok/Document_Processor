@@ -1,12 +1,12 @@
-import logging
 import hashlib
-from typing import Optional
+from typing import Any, Optional
+
 import numpy as np
 
-from doc_preprocessor.extract.base import BaseExtractor
-from doc_preprocessor.models.page_meta import PageMeta
-from doc_preprocessor.models.block import Block, PageResult, BlockType, ParserRoute
 from doc_preprocessor.config.loader import Config
+from doc_preprocessor.extract.base import BaseExtractor
+from doc_preprocessor.models.block import Block, BlockType, PageResult, ParserRoute
+from doc_preprocessor.models.page_meta import PageMeta
 
 try:
     from paddleocr import PaddleOCR
@@ -20,22 +20,22 @@ class OCRAdapter(BaseExtractor):
 
     def __init__(self, config: Config):
         self.config = config
-        self.ocr_model = None
+        self.ocr_model: Any = None
 
     def is_available(self) -> bool:
         return PADDLE_AVAILABLE
 
-    def _init_model(self):
+    def _init_model(self) -> None:
         if not self.ocr_model and self.is_available():
             lang = self.config.ocr.lang[0] if self.config.ocr.lang else "en"
             self.ocr_model = PaddleOCR(
                 use_angle_cls=True,
                 lang=lang,
                 use_gpu=self.config.ocr.use_gpu,
-                show_log=False
+                show_log=False,
             )
 
-    def extract(self, page, image: Optional[np.ndarray], meta: PageMeta) -> PageResult:
+    def extract(self, page: Any, image: Optional[np.ndarray], meta: PageMeta) -> PageResult:
         if not self.is_available():
             raise RuntimeError("PaddleOCR is not installed")
 
@@ -59,20 +59,24 @@ class OCRAdapter(BaseExtractor):
 
         for idx, line in enumerate(ocr_blocks):
             box, (text, confidence) = line
-            text = text.strip()
-            if not text:
+            if not isinstance(text, str):
                 continue
 
-            char_count += len(text)
-            conf_sum += confidence
-            conf_min = min(conf_min, confidence)
+            normalized_text = text.strip()
+            if not normalized_text:
+                continue
+
+            confidence_value = float(confidence)
+            char_count += len(normalized_text)
+            conf_sum += confidence_value
+            conf_min = min(conf_min, confidence_value)
 
             # box is a list of 4 points: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-            x_coords = [p[0] for p in box]
-            y_coords = [p[1] for p in box]
+            x_coords = [float(p[0]) for p in box]
+            y_coords = [float(p[1]) for p in box]
             bbox = [min(x_coords), min(y_coords), max(x_coords), max(y_coords)]
 
-            block_hash = hashlib.sha256(text.lower().encode()).hexdigest()
+            block_hash = hashlib.sha256(normalized_text.lower().encode()).hexdigest()
 
             block = Block(
                 doc_id=meta.doc_id,
@@ -81,14 +85,14 @@ class OCRAdapter(BaseExtractor):
                 page_end=page.number + 1,
                 block_index=idx,
                 block_type=BlockType.PARAGRAPH,
-                text=text,
-                markdown=text,
+                text=normalized_text,
+                markdown=normalized_text,
                 parser_route=ParserRoute.OCR,
-                confidence=confidence,
+                confidence=confidence_value,
                 language=meta.language,
                 bbox=bbox,
                 hash=block_hash,
-                pipeline_version="1.1.0"
+                pipeline_version="1.1.0",
             )
             result.blocks.append(block)
 
